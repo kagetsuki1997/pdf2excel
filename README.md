@@ -9,12 +9,12 @@ text-based PDFs only (no OCR for scanned pages).
 ## Setup
 
 Install [uv](https://docs.astral.sh/uv/). That's all: `uv run` reads the
-dependencies (pdfplumber, xlsxwriter) from the header of the script and installs
+dependencies (pdfplumber, xlsxwriter, pymupdf, fonttools) from the header of the script and installs
 them automatically into a cached environment. Works on Windows, Mac and Linux.
 
 ## Usage
 
-    uv run pdf_tables_to_excel.py INPUT.pdf OUTPUT.xlsx [FIRST] [LAST]
+    uv run pdf_tables_to_excel.py INPUT.pdf OUTPUT.xlsx [FIRST] [LAST] [--figures[=PAGES]]
 
 Pages are 1-based and inclusive.
 
@@ -30,7 +30,56 @@ the PDF is clamped to the last page.
 
 Output: one sheet "All"; each table is preceded by a bold "Page N - table M" label.
 
-Without uv: `pip install pdfplumber xlsxwriter`, then `python pdf_tables_to_excel.py ...`.
+Without uv: `pip install pdfplumber xlsxwriter pymupdf fonttools`, then `python pdf_tables_to_excel.py ...`.
+
+## Figures
+
+Add `--figures` to also export diagrams and charts as pictures. Each page that
+has figures gets its own sheet ("Fig p8", ...); several figures on one page are
+stacked down the sheet, each with a "Page N - figure K" label.
+
+| Command | Figures exported from |
+|---|---|
+| `... in.pdf out.xlsx --figures` | pages found automatically in the FIRST-LAST range |
+| `... in.pdf out.xlsx --figures=5,8,31` | only these pages (ranges like `10-12` work) |
+
+Put `--figures` after the page numbers, or write it as `--figures=5,8,31`.
+If you name a page and no figure is detected there, the whole content area of
+the page is exported.
+
+Auto-detect treats a cluster of drawing items (lines, curves, boxes) or a picture
+as a figure, outside the page header/footer. Short text labels around it and a
+"Figure ..." caption below it are included. Clusters made only of horizontal and
+vertical lines (tables, grids) and anything under 60 pt tall (equations) are
+skipped. It is a heuristic: check the result, and use the page list for pages it
+gets wrong. Figures are rendered at 200 dpi PNG (Excel cannot embed SVG), so they
+stay sharp but are not editable.
+
+Every exported figure is also written for Visio, next to the Excel file:
+
+- `{pdf filename}_svg/p8_fig1.svg` - **clean SVG**: plain paths with absolute coordinates,
+  real `<text>` (font, size, subscripts kept), no transforms or clipping. Symbols the PDF
+  stores as hidden glyphs (like >= and ->) are redrawn from the embedded font as shapes.
+- `{pdf filename}_svg/p8_fig1_outlined.svg` - text converted to outlines: looks exact, text not editable.
+- `{pdf filename}_figures_outlined.vsdx` - **one Visio file, every figure on its own page**
+  (named "p8 fig1" ...). Only plain shapes: straight segments and fills, text drawn as outline
+  shapes. Not editable as text, but the most likely to display in any Visio viewer. Try this first.
+- `{pdf filename}_figures.vsdx` - same, but text is real, editable Visio text
+  (subscripts/superscripts and rotated text kept).
+
+In both `.vsdx` files curves are flattened into short straight segments and dashed lines are
+split into explicit short segments (one online viewer drew only plain solid straight lines and
+dropped curves, dashes and text). The cost: a curve is a polyline, a dashed line is not a Visio
+line pattern.
+
+The `.vsdx` files are written directly by this script and checked only by reading them back with
+Visio's coordinate rules, NOT in Microsoft Visio. If Visio reports a problem, use the clean SVGs
+(Insert, Pictures, or via draw.io export to `.vsdx`) and report the error.
+Shapes are loose (arrows are not glued to boxes) because the PDF has no connection data.
+Raster images inside a figure are included in the SVG but not in the `.vsdx` files.
+
+The window has an "Also export figures" checkbox and a "Figure pages" box for the
+same thing (blank = auto-detect).
 
 ## Notes
 

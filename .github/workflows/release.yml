@@ -19,18 +19,18 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install pdfplumber xlsxwriter pyinstaller
+        run: pip install pdfplumber xlsxwriter pymupdf fonttools pyinstaller
 
       - name: Build GUI exe
         run: >
           pyinstaller --onefile --windowed --name pdf2excel-gui
-          --collect-data pdfminer --collect-all pypdfium2
+          --collect-data pdfminer --collect-all pypdfium2 --collect-all pymupdf
           pdf2excel_gui.py
 
       - name: Build command-line exe
         run: >
           pyinstaller --onefile --name pdf2excel
-          --collect-data pdfminer --collect-all pypdfium2
+          --collect-data pdfminer --collect-all pypdfium2 --collect-all pymupdf
           pdf_tables_to_excel.py
 
       - name: Smoke test CLI exe (prints usage and exits)

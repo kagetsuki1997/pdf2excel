@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["pdfplumber", "xlsxwriter"]
+# dependencies = ["pdfplumber", "xlsxwriter", "pymupdf", "fonttools"]
 # ///
 """Simple window for pdf_tables_to_excel.  Run: uv run pdf2excel_gui.py"""
 import os
@@ -8,6 +8,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import pdf_figures
 import pdf_tables_to_excel as core
 
 
@@ -23,6 +24,8 @@ class App(ttk.Frame):
         self.out = tk.StringVar()
         self.first = tk.StringVar()
         self.last = tk.StringVar()
+        self.do_figs = tk.BooleanVar(value=True)
+        self.fig_pages = tk.StringVar()
         self.status = tk.StringVar(value="Choose a PDF to start.")
 
         ttk.Label(self, text="PDF file").grid(row=0, column=0, sticky="w", pady=4)
@@ -41,12 +44,24 @@ class App(ttk.Frame):
         ttk.Entry(pages, textvariable=self.last, width=6).pack(side="left", padx=6)
         ttk.Label(pages, text="(leave blank = first / last page)", foreground="gray").pack(side="left", padx=6)
 
+        figs = ttk.Frame(self)
+        figs.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 4))
+        ttk.Checkbutton(figs, text="Also export figures (one sheet per page)",
+                        variable=self.do_figs, command=self.toggle_figs).pack(side="left")
+        ttk.Label(figs, text="   Figure pages").pack(side="left")
+        self.fig_entry = ttk.Entry(figs, textvariable=self.fig_pages, width=18)
+        self.fig_entry.pack(side="left", padx=6)
+        ttk.Label(figs, text="e.g. 5, 8, 31-33 (blank = auto-detect)", foreground="gray").pack(side="left")
+
         self.btn = ttk.Button(self, text="Convert", command=self.run)
-        self.btn.grid(row=3, column=0, columnspan=3, pady=(12, 6))
+        self.btn.grid(row=4, column=0, columnspan=3, pady=(12, 6))
         self.bar = ttk.Progressbar(self, mode="indeterminate")
-        self.bar.grid(row=4, column=0, columnspan=3, sticky="ew")
+        self.bar.grid(row=5, column=0, columnspan=3, sticky="ew")
         ttk.Label(self, textvariable=self.status, wraplength=520).grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    def toggle_figs(self):
+        self.fig_entry.state(["!disabled"] if self.do_figs.get() else ["disabled"])
 
     def pick_pdf(self):
         f = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
@@ -71,15 +86,32 @@ class App(ttk.Frame):
             last = int(self.last.get()) if self.last.get().strip() else None
         except ValueError:
             return messagebox.showerror("Pages", "Page numbers must be whole numbers (or blank).")
+        figures = None
+        if self.do_figs.get():
+            figures = "auto"
+            if self.fig_pages.get().strip():
+                try:
+                    with core.pymupdf.open(pdf) as d:
+                        figures = pdf_figures.parse_pages(self.fig_pages.get(), len(d))
+                except ValueError:
+                    return messagebox.showerror("Figure pages", "Use page numbers like 5, 8, 31-33.")
+                if not figures:
+                    return messagebox.showerror("Figure pages", "None of those pages exist in this PDF.")
         self.btn.state(["disabled"])
         self.bar.start(12)
         self.status.set("Converting… (large PDFs can take a while)")
-        threading.Thread(target=self.work, args=(pdf, out, first, last), daemon=True).start()
+        threading.Thread(target=self.work, args=(pdf, out, first, last, figures), daemon=True).start()
 
-    def work(self, pdf, out, first, last):
+    def work(self, pdf, out, first, last, figures):
         try:
-            core.main(pdf, out, first, last)
+            found = core.main(pdf, out, first, last, figures)
             msg, ok = f"Done: {out}", True
+            if figures:
+                msg += "\nFigures: " + (", ".join(f"p{n} x{k}" for n, k in found.items()) or "none found")
+                if found:
+                    stem = os.path.splitext(os.path.basename(pdf))[0]
+                    folder = os.path.dirname(os.path.abspath(out))
+                    msg += f"\nSVG files: {os.path.join(folder, stem + '_svg')}\nVisio files: {os.path.join(folder, stem + '_figures_outlined.vsdx')} (and _figures.vsdx)"
         except SystemExit as e:           # e.g. invalid page range
             msg, ok = str(e.code), False
         except Exception as e:            # noqa: BLE001 - show any failure to the user
