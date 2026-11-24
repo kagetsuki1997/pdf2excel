@@ -8,8 +8,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import pdf_figures
-import pdf_tables_to_excel as core
+import pdf_tables_to_excel as core        # light: heavy libraries load only when Converting
 
 
 class App(ttk.Frame):
@@ -91,12 +90,11 @@ class App(ttk.Frame):
             figures = "auto"
             if self.fig_pages.get().strip():
                 try:
-                    with core.pymupdf.open(pdf) as d:
-                        figures = pdf_figures.parse_pages(self.fig_pages.get(), len(d))
+                    figures = core.parse_pages(self.fig_pages.get())
                 except ValueError:
                     return messagebox.showerror("Figure pages", "Use page numbers like 5, 8, 31-33.")
                 if not figures:
-                    return messagebox.showerror("Figure pages", "None of those pages exist in this PDF.")
+                    return messagebox.showerror("Figure pages", "Enter at least one page number.")
         self.btn.state(["disabled"])
         self.bar.start(12)
         self.status.set("Converting… (large PDFs can take a while)")
@@ -104,6 +102,11 @@ class App(ttk.Frame):
 
     def work(self, pdf, out, first, last, figures):
         try:
+            if isinstance(figures, list):         # drop pages the PDF does not have
+                total = core.count_pages(pdf)
+                figures = [n for n in figures if n <= total]
+                if not figures:
+                    raise SystemExit(f"None of those figure pages exist in this PDF ({total} pages).")
             found = core.main(pdf, out, first, last, figures)
             msg, ok = f"Done: {out}", True
             if figures:
@@ -111,7 +114,7 @@ class App(ttk.Frame):
                 if found:
                     stem = os.path.splitext(os.path.basename(pdf))[0]
                     folder = os.path.dirname(os.path.abspath(out))
-                    msg += f"\nSVG files: {os.path.join(folder, stem + '_svg')}\nVisio files: {os.path.join(folder, stem + '_figures_outlined.vsdx')} (and _figures.vsdx)"
+                    msg += f"\nSVG files: {os.path.join(folder, stem + '_svg')}"
         except SystemExit as e:           # e.g. invalid page range
             msg, ok = str(e.code), False
         except Exception as e:            # noqa: BLE001 - show any failure to the user

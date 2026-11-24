@@ -2,11 +2,10 @@
 # requires-python = ">=3.9"
 # dependencies = ["pdfplumber", "xlsxwriter", "pymupdf", "fonttools"]
 # ///
-"""PDF tables -> Excel, keeping subscripts/superscripts as Excel rich text.
-Optionally also exports figures (diagrams, charts) as pictures, one sheet per page,
-plus, next to the Excel file, one clean SVG per figure in a folder named {pdf filename}_svg
-(and an _outlined.svg with text as outlines) and one {pdf filename}_figures.vsdx Visio file
-with every figure on its own page.
+"""PDF tables -> Excel, keeping subscripts/superscripts as Excel rich text and merged cells merged.
+Optionally also exports figures (diagrams, charts) as pictures, one sheet per page, plus, next to
+the Excel file, a folder named {pdf filename}_svg with a clean SVG and an _outlined.svg
+(text as outlines) per figure.
 
 usage: uv run pdf_tables_to_excel.py in.pdf out.xlsx [first] [last] [--figures [PAGES]]
   no pages      -> all pages
@@ -15,42 +14,84 @@ usage: uv run pdf_tables_to_excel.py in.pdf out.xlsx [first] [last] [--figures [
   none last     -> page 1 to last
   --figures           also export figures found on the pages in the range
   --figures=5,8,31    export figures only from these pages (ranges like 10-12 work too)
+
+The heavy libraries (pdfplumber, pymupdf, ...) are imported only when a conversion runs, so
+importing this module (and starting the GUI) is instant.
 """
 import argparse
 import io
+import math
 import os
 import re
 import sys
-import pdfplumber
-import pymupdf
-import xlsxwriter
-
-import pdf_figures
-import pdf_vector
 
 M = {"": "θ", "": "Ψ", "": "°", "": "µ", "": "Ω", "": "ω"}
 SIZE_DROP = 0.9     # a char is "script" if its size < 90% of the largest size on its line
 RAISE = 0.15        # pt above the line's baseline that counts as superscript
+LINE_SHIFT = 0.7    # a char whose baseline moves more than 0.7 x font size starts a new line
+
+
+def parse_pages(text):
+    """'5, 8, 10-12' -> sorted list of 1-based page numbers (raises ValueError on junk)."""
+    pages = set()
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b or a)
+        pages.update(range(min(lo, hi), max(lo, hi) + 1))
+    return sorted(p for p in pages if p >= 1)
+
+
+def count_pages(pdf):
+    import pymupdf
+    with pymupdf.open(pdf) as d:
+        return len(d)
+
+
+def split_lines(chars):
+    """Group a cell's characters into text lines by baseline.
+
+    Spaces never decide anything (some PDFs size them differently from the letters). A line is
+    broken only when a letter's baseline moves by more than LINE_SHIFT x font size, which is far
+    more than any subscript/superscript offset but less than any line pitch."""
+    lines = []
+    for c in chars:
+        if not c["text"].strip():
+            if lines:
+                lines[-1].append(c)
+            else:
+                lines.append([c])
+            continue
+        if lines:
+            letters = [x for x in lines[-1] if x["text"].strip()]
+            if letters:
+                big = max(x["size"] for x in letters)
+                ref = next(x["matrix"][5] for x in letters if x["size"] >= big - 0.05)
+                if abs(c["matrix"][5] - ref) > LINE_SHIFT * max(big, c["size"]):
+                    lines.append([c])
+                    continue
+            lines[-1].append(c)
+        else:
+            lines.append([c])
+    return lines
 
 
 def cell_runs(page, bbox):
     """Return [(text, kind)] runs; kind is '', 'sub' or 'sup'."""
     chars = [c for c in page.crop(bbox).chars if c["text"] != "\n"]
-    lines = []                      # chars arrive in reading order; split where text drops to a new line
-    for c in chars:
-        if lines and c["top"] < max(x["bottom"] for x in lines[-1]) - 0.3 * c["size"]:
-            lines[-1].append(c)
-        else:
-            lines.append([c])
     runs = []
-    for line in lines:
-        big = max(c["size"] for c in line)
-        ref_base = next(c["matrix"][5] for c in line if c["size"] >= big - 0.05)
+    for line in split_lines(chars):
+        letters = [c for c in line if c["text"].strip()]
+        if not letters:
+            continue
         if runs:
             runs.append((" ", ""))
+        big = max(c["size"] for c in letters)
+        ref_base = next(c["matrix"][5] for c in letters if c["size"] >= big - 0.05)
         for c in line:
             kind = ""
-            if c["size"] < big * SIZE_DROP and c["text"].strip():
+            if c["text"].strip() and c["size"] < big * SIZE_DROP:
                 # PDF y grows upward: raised baseline = superscript, otherwise subscript
                 kind = "sup" if c["matrix"][5] - ref_base > RAISE else "sub"
             runs.append((M.get(c["text"], c["text"]), kind))
@@ -61,16 +102,6 @@ def cell_runs(page, bbox):
         else:
             merged.append((t, k))
     return merged
-
-
-def join_runs(parts):
-    res = []
-    for p in parts:
-        if p:
-            if res:
-                res.append((" ", ""))
-            res.extend(p)
-    return res
 
 
 def clean_runs(runs):
@@ -104,21 +135,43 @@ def write_cell(ws, wb, row, col, runs, fmt):
     ws.write_rich_string(row, col, *parts, fmt)
 
 
-def table_rows(page, table):
-    rows = [[cell_runs(page, c) if c else [] for c in row.cells] for row in table.rows]
-    # columns with a blank header are the right-hand part of a spanning header: fold them left
-    header = ["".join(t for t, _ in c).strip() for c in rows[0]]
-    groups = []
-    for i, h in enumerate(header):
-        if h or not groups:
-            groups.append([i])
+def _boundaries(values, tol=1.5):
+    """Sorted coordinates with values closer than tol merged into one boundary."""
+    out = []
+    for v in sorted(values):
+        if out and v - out[-1][-1] <= tol:
+            out[-1].append(v)
         else:
-            groups[-1].append(i)
-    return [[join_runs([r[i] for i in g]) for g in groups] for r in rows]
+            out.append([v])
+    return [sum(g) / len(g) for g in out]
+
+
+def _index(v, bounds):
+    return min(range(len(bounds)), key=lambda i: abs(bounds[i] - v))
+
+
+def table_grid(page, table):
+    """Return (grid, merges). grid[r][c] = runs of the cell starting there ([] elsewhere);
+    merges = [(r0, c0, r1, c1)] for cells that span several rows/columns (merged cells)."""
+    cells = list(table.cells)
+    xs = _boundaries([c[0] for c in cells] + [c[2] for c in cells])
+    ys = _boundaries([c[1] for c in cells] + [c[3] for c in cells])
+    grid = [[[] for _ in range(len(xs) - 1)] for _ in range(len(ys) - 1)]
+    merges = []
+    for cb in cells:
+        c0, c1 = _index(cb[0], xs), _index(cb[2], xs) - 1
+        r0, r1 = _index(cb[1], ys), _index(cb[3], ys) - 1
+        if c1 < c0 or r1 < r0:
+            continue
+        grid[r0][c0] = cell_runs(page, cb)
+        if c1 > c0 or r1 > r0:
+            merges.append((r0, c0, r1, c1))
+    return grid, merges
 
 
 def save_svg(page, rect, path, pad=4):
     """Write one figure as SVG (text converted to outlines so symbols and fonts stay exact)."""
+    import pdf_figures
     original = page.cropbox
     try:
         page.set_cropbox(pdf_figures._inflate(rect, pad) & page.rect)
@@ -128,13 +181,13 @@ def save_svg(page, rect, path, pad=4):
         page.set_cropbox(original)
 
 
-def write_figures(wb, pdf, pages, manual, svg_dir, vsdx_path, dpi=200):
+def write_figures(wb, pdf, pages, manual, svg_dir, dpi=200):
     """One sheet per page that has figures. Also writes, per figure, a clean SVG and an
-    outlined SVG into svg_dir, and all figures into one .vsdx (one Visio page per figure).
-    Returns {page: number_of_figures}."""
+    outlined SVG into svg_dir. Returns {page: number_of_figures}."""
+    import pymupdf
+    import pdf_figures
+    import pdf_vector
     found = {}
-    visio = pdf_vector.VsdxWriter()                    # real, editable Visio text
-    visio_outlined = pdf_vector.VsdxWriter()           # text drawn as outline shapes (works in any viewer)
     bold = wb.add_format({"bold": True})
     with pymupdf.open(pdf) as doc:
         for n in pages:
@@ -155,27 +208,25 @@ def write_figures(wb, pdf, pages, manual, svg_dir, vsdx_path, dpi=200):
                 clean = pdf_vector.extract_figure(page, r)
                 with open(os.path.join(svg_dir, f"p{n}_fig{k}.svg"), "w", encoding="utf-8") as fh:
                     fh.write(pdf_vector.to_svg(clean))
-                visio.add_figure(f"p{n} fig{k}", clean)
-                visio_outlined.add_figure(f"p{n} fig{k}", pdf_vector.extract_figure(page, r, text_outlines=True))
                 ws.write_string(row, 0, f"Page {n} - figure {k}", bold)
                 # the PNG carries its dpi, so Excel shows it at natural size
                 ws.insert_image(row + 1, 0, f"p{n}_fig{k}.png",
                                 {"image_data": io.BytesIO(png), "object_position": 1})
                 row += int(h_pt * 96 / 72 / 20) + 4      # default row height is 20 px
             found[n] = len(rects)
-    if found:
-        visio.save(vsdx_path)
-        visio_outlined.save(vsdx_path.replace(".vsdx", "_outlined.vsdx"))
     return found
 
 
 def main(pdf, out, first=None, last=None, figures=None):
     """figures: None = no figures, "auto" = detect on the page range, or a list of pages."""
+    import pdfplumber
+    import xlsxwriter
     wb = xlsxwriter.Workbook(out)
     ws = wb.add_worksheet("All")
     cell = wb.add_format({"text_wrap": True, "valign": "top"})
     bold = wb.add_format({"bold": True})
     row, width = 0, {}
+    spans = []          # (row, first_col, last_col, text_length) of merged cells, for row heights
     with pdfplumber.open(pdf) as p:
         total = len(p.pages)
         first = max(1, first or 1)
@@ -187,30 +238,43 @@ def main(pdf, out, first=None, last=None, figures=None):
             for ti, t in enumerate(page.find_tables(), 1):
                 ws.write_string(row, 0, f"Page {n} - table {ti}", bold)
                 row += 1
-                for r in table_rows(page, t):
-                    for ci, runs in enumerate(r):
-                        write_cell(ws, wb, row, ci, runs, cell)
-                        w = len("".join(x for x, _ in runs))
-                        width[ci] = max(width.get(ci, 0), w)
-                    row += 1
-                row += 1
+                grid, merges = table_grid(page, t)
+                for r0, c0, r1, c1 in merges:       # merge first, then write the top-left cell
+                    try:
+                        ws.merge_range(row + r0, c0, row + r1, c1, "", cell)
+                    except Exception:               # overlapping/degenerate span in an odd PDF: keep unmerged
+                        pass
+                for ri, cells_in_row in enumerate(grid):
+                    for ci, runs in enumerate(cells_in_row):
+                        write_cell(ws, wb, row + ri, ci, runs, cell)
+                for ri, cells_in_row in enumerate(grid):
+                    for ci, runs in enumerate(cells_in_row):
+                        length = len("".join(x for x, _ in clean_runs(runs)))
+                        span = next((m for m in merges if (m[0], m[1]) == (ri, ci)), None)
+                        if span is None:
+                            width[ci] = max(width.get(ci, 0), length)
+                        elif span[2] == span[0] and length:
+                            spans.append((row + ri, span[1], span[3], length))
+                row += len(grid) + 1
     for ci, w in width.items():
         ws.set_column(ci, ci, min(45, w + 2))
+    for r, c0, c1, length in spans:       # Excel does not auto-fit merged cells: size their rows
+        chars = sum(min(45, width.get(c, 8) + 2) for c in range(c0, c1 + 1))
+        ws.set_row(r, 15 * max(1, math.ceil(length * 1.1 / max(chars, 1))))
     found = {}
+    svg_dir = None
     if figures:
         manual = figures != "auto"
         pages = [n for n in figures if 1 <= n <= total] if manual else range(first, last + 1)
         stem = os.path.splitext(os.path.basename(pdf))[0]
         svg_dir = os.path.join(os.path.dirname(os.path.abspath(out)), f"{stem}_svg")
-        vsdx_path = os.path.join(os.path.dirname(os.path.abspath(out)), f"{stem}_figures.vsdx")
-        found = write_figures(wb, pdf, pages, manual, svg_dir, vsdx_path)
+        found = write_figures(wb, pdf, pages, manual, svg_dir)
     wb.close()
     print(row, "table rows")
     if figures:
         print("figures:", ", ".join(f"p{n} x{k}" for n, k in found.items()) or "none found")
         if found:
             print("SVG files:", svg_dir)
-            print("Visio files:", vsdx_path, "and", vsdx_path.replace(".vsdx", "_outlined.vsdx"))
     return found
 
 
@@ -229,9 +293,8 @@ if __name__ == "__main__":
     a = ap.parse_args()
     figs = a.figures
     if figs and figs != "auto":
-        with pymupdf.open(a.pdf) as d:
-            try:
-                figs = pdf_figures.parse_pages(figs, len(d))
-            except ValueError:
-                sys.exit("--figures: use page numbers like 5,8,31 or 10-12")
+        try:
+            figs = parse_pages(figs)
+        except ValueError:
+            sys.exit("--figures: use page numbers like 5,8,31 or 10-12")
     main(a.pdf, a.out, a.first, a.last, figs)

@@ -1,9 +1,8 @@
-"""Turn a figure on a PDF page into clean vector output: a plain SVG and a Visio .vsdx.
+"""Turn a figure on a PDF page into a clean vector SVG.
 
-The figure is read once (extract_figure) as simple shapes + text, then written as
-  * to_svg(fig)        - flat SVG: paths with absolute coordinates, real <text>, no transforms/clipping
-  * VsdxWriter         - one .vsdx file, one Visio page per figure, every line/curve a Visio shape,
-                         every text line a Visio text shape (subscripts/superscripts kept)
+The figure is read once (extract_figure) as simple shapes + text, then written by to_svg():
+a flat SVG with paths in absolute coordinates, real <text> with sub/superscripts, no transforms
+or clipping. Symbols the PDF stores as hidden glyphs (like >= and ->) are redrawn as shapes.
 
 Everything is in PDF points with the origin at the top-left of the figure.
 """
@@ -11,7 +10,6 @@ import base64
 import io
 import math
 import re
-import zipfile
 from xml.sax.saxutils import escape, quoteattr
 
 import pymupdf
@@ -134,10 +132,9 @@ class _OutlinePen(BasePen):
             self.cur.append(("L", *self.start))
 
 
-def _unmapped_glyphs(page, clip, all_text=False):
-    """Outlines of glyphs as filled shapes. By default only symbols (>=, ->, ...) that the PDF stores
-    as a blank char (a real space has an empty outline; contours behind a ' ' mean a hidden symbol).
-    With all_text=True every character becomes an outline (text that needs no font at all)."""
+def _unmapped_glyphs(page, clip):
+    """Symbols (>=, ->, ...) that the PDF stores as a blank char, as filled outline shapes.
+    A real space has an empty outline; contours behind a ' ' mean a hidden symbol."""
     shapes, marks, fonts = [], [], {}
     doc, pno = page.parent, page.number
     try:
@@ -147,7 +144,7 @@ def _unmapped_glyphs(page, clip, all_text=False):
     page_fonts = None
     for sp in trace:
         for code, gid, origin, *_ in sp["chars"]:
-            if (code != 32 and not all_text) or not clip.contains(pymupdf.Point(*origin)):
+            if code != 32 or not clip.contains(pymupdf.Point(*origin)):
                 continue
             if page_fonts is None:
                 page_fonts = [f for f in doc.get_page_fonts(pno) if f[1] in ("ttf", "otf")]
@@ -171,9 +168,8 @@ def _unmapped_glyphs(page, clip, all_text=False):
                 pen = _OutlinePen(tt.getGlyphSet(), sp["size"] / tt["head"].unitsPerEm,
                                   origin[0] - clip.x0, origin[1] - clip.y0, sp.get("dir") or (1.0, 0.0))
                 tt.getGlyphSet()[name].draw(pen)
-                if code == 32:
-                    adv = tt["hmtx"][name][0] / tt["head"].unitsPerEm * sp["size"]
-                    marks.append((origin[0], origin[1], max(1, round(adv / (0.278 * sp["size"])))))
+                adv = tt["hmtx"][name][0] / tt["head"].unitsPerEm * sp["size"]
+                marks.append((origin[0], origin[1], max(1, round(adv / (0.278 * sp["size"])))))
                 col = sp.get("color") or (0, 0, 0)
                 shapes.append({"subpaths": [s for s in pen.subs if len(s) > 1], "fill": _hex(col),
                                "fill_opacity": 1.0, "stroke": None, "stroke_opacity": 1.0, "width": 0.5,
@@ -182,9 +178,8 @@ def _unmapped_glyphs(page, clip, all_text=False):
     return shapes, marks
 
 
-def extract_figure(page, rect, pad=4, text_outlines=False):
-    """Read the vector content of `rect` (plus pad) on a pymupdf page.
-    text_outlines=True turns all text into outline shapes (no text objects)."""
+def extract_figure(page, rect, pad=4):
+    """Read the vector content of `rect` (plus pad) on a pymupdf page."""
     clip = (pymupdf.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad) & page.rect)
     ox, oy = clip.x0, clip.y0
     page_area = page.rect.width * page.rect.height
@@ -214,7 +209,7 @@ def extract_figure(page, rect, pad=4, text_outlines=False):
             "even_odd": bool(d.get("even_odd")),
         })
 
-    glyph_shapes, marks = _unmapped_glyphs(page, clip, all_text=text_outlines)
+    glyph_shapes, marks = _unmapped_glyphs(page, clip)
     shapes.extend(glyph_shapes)
 
     texts = []
@@ -230,7 +225,7 @@ def extract_figure(page, rect, pad=4, text_outlines=False):
             out.append(ch)
         return "".join(out)
 
-    for blk in ([] if text_outlines else page.get_text("rawdict", clip=clip)["blocks"]):
+    for blk in page.get_text("rawdict", clip=clip)["blocks"]:
         for ln in blk.get("lines", []):
             for sp in ln["spans"]:
                 sp["text"] = span_text(sp)
@@ -327,258 +322,3 @@ def to_svg(fig):
                    f' xml:space="preserve"{tr}>{"".join(spans)}</text>')
     out.append("</svg>")
     return "\n".join(out)
-
-
-# ----------------------------------------------------------------------------- Visio .vsdx
-NS = "http://schemas.microsoft.com/office/visio/2012/main"
-NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-MARGIN = 0.3   # inches around the figure on its Visio page
-
-
-def _v(x):
-    return "%.6f" % x
-
-
-def _cell(name, value, unit=None):
-    u = f' U="{unit}"' if unit else ""
-    return f'<Cell N="{name}" V="{value}"{u}/>'
-
-
-def _flatten(sub):
-    """Replace cubic Beziers by short straight segments: ['M',x,y] / ['L',x,y] only."""
-    out, cur = [], None
-    for seg in sub:
-        if seg[0] == "C" and cur is not None:
-            x0, y0 = cur
-            x1, y1, x2, y2, x3, y3 = seg[1:]
-            length = (math.hypot(x1 - x0, y1 - y0) + math.hypot(x2 - x1, y2 - y1) + math.hypot(x3 - x2, y3 - y2))
-            n = max(6, min(30, int(length / 2.5) + 4))
-            for i in range(1, n + 1):
-                t = i / n
-                u = 1 - t
-                out.append(("L", u**3 * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t**3 * x3,
-                            u**3 * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t**3 * y3))
-            cur = (x3, y3)
-        else:
-            out.append(seg)
-            cur = (seg[1], seg[2]) if seg[0] in ("M", "L") else (seg[5], seg[6])
-    return out
-
-
-def _dash_pieces(points, pattern):
-    """Split a polyline [(x, y)...] into the 'on' pieces of a dash pattern [on, off, on, off...]."""
-    pat = [max(p, 0.05) for p in pattern]
-    if len(pat) % 2:
-        pat = pat * 2
-    pieces, cur, idx, left = [], [points[0]], 0, pat[0]
-    for (xa, ya), (xb, yb) in zip(points, points[1:]):
-        seg = math.hypot(xb - xa, yb - ya)
-        pos = 0.0
-        while seg - pos > 1e-9:
-            step = min(left, seg - pos)
-            pos += step
-            left -= step
-            px, py = xa + (xb - xa) * pos / seg, ya + (yb - ya) * pos / seg
-            if idx % 2 == 0:
-                cur.append((px, py))
-            if left <= 1e-9:
-                if idx % 2 == 0:
-                    pieces.append(cur)
-                idx += 1
-                left = pat[idx % len(pat)]
-                cur = [(px, py)]
-    if idx % 2 == 0 and len(cur) > 1:
-        pieces.append(cur)
-    return [p for p in pieces if len(p) > 1]
-
-
-class VsdxWriter:
-    """Collects figures (as pages) and writes a single .vsdx file.
-
-    flatten=True     curves become straight segments (viewers that ignore Bezier rows still draw them)
-    native_dash=False dashed lines become explicit short solid segments (instead of a Visio line pattern)
-    """
-
-    def __init__(self, flatten=True, native_dash=False):
-        self.pages = []          # (name, page_xml, width_in, height_in)
-        self.fonts = ["Arial"]
-        self.flatten, self.native_dash = flatten, native_dash
-
-    def _prepare(self, shapes):
-        out = []
-        for sh in shapes:
-            subs = [_flatten(sub) for sub in sh["subpaths"]] if self.flatten else sh["subpaths"]
-            sh = dict(sh, subpaths=subs)
-            if sh["dash"] and sh["stroke"] and not self.native_dash:
-                if sh["fill"]:
-                    out.append(dict(sh, stroke=None, dash=[]))
-                pieces = []
-                for sub in subs:
-                    pts = [(seg[1], seg[2]) for seg in sub if seg[0] in ("M", "L")]
-                    if len(pts) > 1 and len(pts) == len(sub):
-                        for piece in _dash_pieces(pts, sh["dash"]):
-                            pieces.append([("M", *piece[0])] + [("L", *p) for p in piece[1:]])
-                    else:
-                        pieces.append(sub)           # contains curves we could not flatten: keep solid
-                out.append(dict(sh, fill=None, dash=[], subpaths=pieces))
-            else:
-                out.append(sh)
-        return out
-
-    def _font_id(self, family):
-        if family not in self.fonts:
-            self.fonts.append(family)
-        return self.fonts.index(family)
-
-    def add_figure(self, name, fig):
-        H = fig["height"]
-        W_in = fig["width"] / 72 + 2 * MARGIN
-        H_in = H / 72 + 2 * MARGIN
-
-        def px(x):
-            return MARGIN + x / 72
-
-        def py(y):
-            return MARGIN + (H - y) / 72
-
-        shapes, sid = [], 0
-        for sh in self._prepare(fig["shapes"]):
-            rows, pts = [], []
-            ix = 0
-            for sub in sh["subpaths"]:
-                for seg in sub:
-                    c = [(px(seg[i]), py(seg[i + 1])) for i in range(1, len(seg), 2)]
-                    pts.extend(c)
-            if not pts:
-                continue
-            minx, miny = min(p[0] for p in pts), min(p[1] for p in pts)
-            w, h = max(max(p[0] for p in pts) - minx, 1e-4), max(max(p[1] for p in pts) - miny, 1e-4)
-            for sub in sh["subpaths"]:
-                for seg in sub:
-                    c = [(px(seg[i]) - minx, py(seg[i + 1]) - miny) for i in range(1, len(seg), 2)]
-                    ix += 1
-                    if seg[0] == "M":
-                        rows.append(f'<Row T="MoveTo" IX="{ix}">{_cell("X", _v(c[0][0]))}{_cell("Y", _v(c[0][1]))}</Row>')
-                    elif seg[0] == "L":
-                        rows.append(f'<Row T="LineTo" IX="{ix}">{_cell("X", _v(c[0][0]))}{_cell("Y", _v(c[0][1]))}</Row>')
-                    else:   # cubic Bezier: end point, then the two control points
-                        rows.append(f'<Row T="CubicBezTo" IX="{ix}">{_cell("X", _v(c[2][0]))}{_cell("Y", _v(c[2][1]))}'
-                                    f'{_cell("A", _v(c[0][0]))}{_cell("B", _v(c[0][1]))}'
-                                    f'{_cell("C", _v(c[1][0]))}{_cell("D", _v(c[1][1]))}</Row>')
-            sid += 1
-            dash = sh["dash"]
-            pattern = 1 if not dash else (3 if dash[0] < 1.0 else 2)
-            cells = [_cell("PinX", _v(minx)), _cell("PinY", _v(miny)), _cell("Width", _v(w)), _cell("Height", _v(h)),
-                     _cell("LocPinX", "0"), _cell("LocPinY", "0"), _cell("Angle", "0")]
-            if sh["stroke"]:
-                cells += [_cell("LineWeight", _v(sh["width"] / 72)), _cell("LineColor", sh["stroke"]),
-                          _cell("LinePattern", pattern)]
-            else:
-                cells += [_cell("LinePattern", "0")]
-            if sh["fill"]:
-                cells += [_cell("FillForegnd", sh["fill"]), _cell("FillPattern", "1")]
-            else:
-                cells += [_cell("FillPattern", "0")]
-            geom = (f'<Section N="Geometry" IX="0">{_cell("NoFill", 0 if sh["fill"] else 1)}'
-                    f'{_cell("NoLine", 0 if sh["stroke"] else 1)}{_cell("NoShow", 0)}{_cell("NoSnap", 0)}'
-                    f'{_cell("NoQuickDrag", 0)}{"".join(rows)}</Section>')
-            shapes.append(f'<Shape ID="{sid}" Type="Shape" LineStyle="0" FillStyle="0" TextStyle="0">'
-                          f'{"".join(cells)}{geom}</Shape>')
-
-        for t in fig["texts"]:
-            sid += 1
-            dx, dy = t["dir"]
-            x0, y0, x1, y1 = t["bbox"]
-            bw, bh = x1 - x0, y1 - y0
-            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-            length = abs(bw * dx) + abs(bh * dy)
-            thick = abs(bw * dy) + abs(bh * dx)
-            sx, sy = cx - dx * length / 2, cy - dy * length / 2        # where the text starts
-            width_in = length / 72 * 1.15 + 0.04                       # a little slack so Visio never wraps
-            height_in = max(thick / 72, 0.05)
-            angle = math.atan2(-dy, dx)                                # Visio: counter-clockwise, y up
-            text, chars = [], []
-            for i, r in enumerate(t["runs"]):
-                text.append(f'<cp IX="{i}"/>{escape(r["text"])}')
-                style = (1 if r["bold"] else 0) | (2 if r["italic"] else 0)
-                size = t["size"] if r["kind"] else r["size"]
-                pos = {"": 0, "sup": 1, "sub": 2}[r["kind"]]
-                chars.append(f'<Row IX="{i}">{_cell("Font", self._font_id(r["family"]))}{_cell("Color", r["color"])}'
-                             f'{_cell("Style", style)}{_cell("Pos", pos)}{_cell("Size", _v(size / 72))}</Row>')
-            cells = [_cell("PinX", _v(px(sx))), _cell("PinY", _v(py(sy))), _cell("Width", _v(width_in)),
-                     _cell("Height", _v(height_in)), _cell("LocPinX", "0"), _cell("LocPinY", _v(height_in / 2)),
-                     _cell("Angle", _v(angle)), _cell("LeftMargin", "0"), _cell("RightMargin", "0"),
-                     _cell("TopMargin", "0"), _cell("BottomMargin", "0"), _cell("VerticalAlign", "1"),
-                     _cell("FillPattern", "0"), _cell("LinePattern", "0")]
-            geom = (f'<Section N="Geometry" IX="0">{_cell("NoFill", 1)}{_cell("NoLine", 1)}{_cell("NoShow", 0)}'
-                    f'{_cell("NoSnap", 0)}{_cell("NoQuickDrag", 0)}'
-                    f'<Row T="MoveTo" IX="1">{_cell("X", "0")}{_cell("Y", "0")}</Row>'
-                    f'<Row T="LineTo" IX="2">{_cell("X", _v(width_in))}{_cell("Y", "0")}</Row>'
-                    f'<Row T="LineTo" IX="3">{_cell("X", _v(width_in))}{_cell("Y", _v(height_in))}</Row>'
-                    f'<Row T="LineTo" IX="4">{_cell("X", "0")}{_cell("Y", _v(height_in))}</Row>'
-                    f'<Row T="LineTo" IX="5">{_cell("X", "0")}{_cell("Y", "0")}</Row></Section>')
-            para = f'<Section N="Paragraph"><Row IX="0">{_cell("HorzAlign", "0")}</Row></Section>'
-            char = f'<Section N="Character">{"".join(chars)}</Section>'
-            shapes.append(f'<Shape ID="{sid}" Type="Shape" LineStyle="0" FillStyle="0" TextStyle="0">'
-                          f'{"".join(cells)}{para}{char}{geom}<Text><pp IX="0"/>{"".join(text)}</Text></Shape>')
-
-        xml = (f'<?xml version="1.0" encoding="utf-8"?>\n<PageContents xmlns="{NS}" xmlns:r="{NS_R}" '
-               f'xml:space="preserve"><Shapes>{"".join(shapes)}</Shapes></PageContents>')
-        self.pages.append((name, xml, W_in, H_in, len(fig["images"])))
-
-    def save(self, path):
-        n = len(self.pages)
-        ct = ['<?xml version="1.0" encoding="utf-8"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-              '<Default Extension="xml" ContentType="application/xml"/>'
-              '<Override PartName="/visio/document.xml" ContentType="application/vnd.ms-visio.drawing.main+xml"/>'
-              '<Override PartName="/visio/pages/pages.xml" ContentType="application/vnd.ms-visio.pages+xml"/>']
-        ct += [f'<Override PartName="/visio/pages/page{i}.xml" ContentType="application/vnd.ms-visio.page+xml"/>'
-               for i in range(1, n + 1)]
-        ct.append("</Types>")
-
-        rels = ('<?xml version="1.0" encoding="utf-8"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                '<Relationship Id="rId1" Type="http://schemas.microsoft.com/visio/2010/relationships/document" Target="visio/document.xml"/>'
-                '</Relationships>')
-        doc_rels = ('<?xml version="1.0" encoding="utf-8"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                    '<Relationship Id="rId1" Type="http://schemas.microsoft.com/visio/2010/relationships/pages" Target="pages/pages.xml"/>'
-                    '</Relationships>')
-        faces = "".join(f'<FaceName ID="{i}" NameU={quoteattr(f)} UnicodeRanges="-536870145 1073786111 1 0" '
-                        f'CharSets="1073742335 -65536" Panose="2 11 6 4 2 2 2 2 2 4" Flags="325"/>'
-                        for i, f in enumerate(self.fonts))
-        style = ('<StyleSheets><StyleSheet ID="0" NameU="No Style" IsCustomName="1" Name="No Style">'
-                 + _cell("LineWeight", "0.01041666666666667") + _cell("LineColor", "#000000") + _cell("LinePattern", "1")
-                 + _cell("FillForegnd", "#ffffff") + _cell("FillBkgnd", "#000000") + _cell("FillPattern", "1")
-                 + _cell("LeftMargin", "0.1") + _cell("RightMargin", "0.1") + _cell("TopMargin", "0.05")
-                 + _cell("BottomMargin", "0.05") + _cell("VerticalAlign", "1")
-                 + '<Section N="Character"><Row IX="0">' + _cell("Font", "0") + _cell("Color", "#000000")
-                 + _cell("Size", "0.1111111111111111") + '</Row></Section>'
-                 + '<Section N="Paragraph"><Row IX="0">' + _cell("HorzAlign", "1") + '</Row></Section>'
-                 + '</StyleSheet></StyleSheets>')
-        document = (f'<?xml version="1.0" encoding="utf-8"?>\n<VisioDocument xmlns="{NS}" xmlns:r="{NS_R}" xml:space="preserve">'
-                    '<DocumentSettings TopPage="0" DefaultTextStyle="0" DefaultLineStyle="0" DefaultFillStyle="0"/>'
-                    f'<FaceNames>{faces}</FaceNames>{style}</VisioDocument>')
-        page_entries, page_rels = [], []
-        for i, (name, _xml, w, h, _imgs) in enumerate(self.pages, 1):
-            sheet = ("<PageSheet LineStyle=\"0\" FillStyle=\"0\" TextStyle=\"0\">"
-                     + _cell("PageWidth", _v(w)) + _cell("PageHeight", _v(h)) + _cell("PageScale", "1", "IN")
-                     + _cell("DrawingScale", "1", "IN") + _cell("DrawingSizeType", "3") + _cell("DrawingScaleType", "0")
-                     + _cell("PageLockReplace", "0") + "</PageSheet>")
-            page_entries.append(f'<Page ID="{i - 1}" NameU={quoteattr(name)} Name={quoteattr(name)}>{sheet}'
-                                f'<Rel r:id="rId{i}"/></Page>')
-            page_rels.append(f'<Relationship Id="rId{i}" Type="http://schemas.microsoft.com/visio/2010/relationships/page" '
-                             f'Target="page{i}.xml"/>')
-        pages = (f'<?xml version="1.0" encoding="utf-8"?>\n<Pages xmlns="{NS}" xmlns:r="{NS_R}" xml:space="preserve">'
-                 f'{"".join(page_entries)}</Pages>')
-        pages_rels = ('<?xml version="1.0" encoding="utf-8"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                      f'{"".join(page_rels)}</Relationships>')
-
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("[Content_Types].xml", "".join(ct))
-            z.writestr("_rels/.rels", rels)
-            z.writestr("visio/document.xml", document)
-            z.writestr("visio/_rels/document.xml.rels", doc_rels)
-            z.writestr("visio/pages/pages.xml", pages)
-            z.writestr("visio/pages/_rels/pages.xml.rels", pages_rels)
-            for i, (_n_, xml, *_rest) in enumerate(self.pages, 1):
-                z.writestr(f"visio/pages/page{i}.xml", xml)

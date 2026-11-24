@@ -131,15 +131,3 @@ def render_png(page, rect, dpi=200, pad=4):
     clip = _inflate(rect, pad) & page.rect
     pix = page.get_pixmap(clip=clip, dpi=dpi)
     return pix.tobytes("png"), clip.width, clip.height
-
-
-def parse_pages(text, total):
-    """'5, 8, 10-12' -> sorted list of valid 1-based page numbers (raises ValueError on junk)."""
-    pages = set()
-    for part in text.replace(" ", "").split(","):
-        if not part:
-            continue
-        a, _, b = part.partition("-")
-        lo, hi = int(a), int(b or a)
-        pages.update(range(min(lo, hi), max(lo, hi) + 1))
-    return sorted(p for p in pages if 1 <= p <= total)

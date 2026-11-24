@@ -55,28 +55,17 @@ skipped. It is a heuristic: check the result, and use the page list for pages it
 gets wrong. Figures are rendered at 200 dpi PNG (Excel cannot embed SVG), so they
 stay sharp but are not editable.
 
-Every exported figure is also written for Visio, next to the Excel file:
+Every exported figure is also saved as SVG, in a folder named `{pdf filename}_svg` next to
+the Excel file:
 
-- `{pdf filename}_svg/p8_fig1.svg` - **clean SVG**: plain paths with absolute coordinates,
-  real `<text>` (font, size, subscripts kept), no transforms or clipping. Symbols the PDF
-  stores as hidden glyphs (like >= and ->) are redrawn from the embedded font as shapes.
-- `{pdf filename}_svg/p8_fig1_outlined.svg` - text converted to outlines: looks exact, text not editable.
-- `{pdf filename}_figures_outlined.vsdx` - **one Visio file, every figure on its own page**
-  (named "p8 fig1" ...). Only plain shapes: straight segments and fills, text drawn as outline
-  shapes. Not editable as text, but the most likely to display in any Visio viewer. Try this first.
-- `{pdf filename}_figures.vsdx` - same, but text is real, editable Visio text
-  (subscripts/superscripts and rotated text kept).
+- `p8_fig1.svg` - **clean SVG**: plain paths with absolute coordinates, real `<text>` (font, size,
+  subscripts kept), no transforms or clipping. Symbols the PDF stores as hidden glyphs (like >= and
+  ->) are redrawn from the embedded font as shapes.
+- `p8_fig1_outlined.svg` - text converted to outlines: looks exact, text not editable.
 
-In both `.vsdx` files curves are flattened into short straight segments and dashed lines are
-split into explicit short segments (one online viewer drew only plain solid straight lines and
-dropped curves, dashes and text). The cost: a curve is a polyline, a dashed line is not a Visio
-line pattern.
-
-The `.vsdx` files are written directly by this script and checked only by reading them back with
-Visio's coordinate rules, NOT in Microsoft Visio. If Visio reports a problem, use the clean SVGs
-(Insert, Pictures, or via draw.io export to `.vsdx`) and report the error.
-Shapes are loose (arrows are not glued to boxes) because the PDF has no connection data.
-Raster images inside a figure are included in the SVG but not in the `.vsdx` files.
+To use a figure in Visio, insert the SVG (Insert, Pictures), or open it in draw.io and export
+`.vsdx` for editable shapes. (A direct `.vsdx` export was tried and removed: it did not display
+reliably in viewers.) Raster images inside a figure are included in the clean SVG.
 
 The window has an "Also export figures" checkbox and a "Figure pages" box for the
 same thing (blank = auto-detect).
@@ -87,21 +76,24 @@ same thing (blank = auto-detect).
   the baseline = superscript, otherwise subscript. Tune `SIZE_DROP` / `RAISE`
   at the top of the script if a PDF uses different sizes.
 - Superscripts are implemented but not yet tested on a real PDF.
-- Blank-header columns are merged into the column on their left
-  (fixes spanning headers such as "Test Conditions").
+- Merged cells in the PDF table are merged in Excel too (spanning headers, vertically merged cells).
+- A line inside a cell is a new line only when its baseline moves by more than 0.7 x font size,
+  so wrapped text works and spaces sized differently from the letters cannot turn a cell into subscripts.
 - Symbol-font characters are mapped to θ Ψ ° µ Ω ω. Add more to `M` if a PDF
   shows odd characters.
-- Rows like "RT6338C/CH" with an empty Parameter cell belong to the row above.
 - Formatting shows in Excel; some viewers (Preview, Numbers) may not show it.
 
-## Windows exe (no Python or uv needed)
+## Windows build (no Python or uv needed)
 
-`.github/workflows/release.yml` builds two exe files with PyInstaller on GitHub:
-`pdf2excel-gui.exe` (window) and `pdf2excel.exe` (command line, same arguments
-as the script). Push a version tag to build them and attach them to a release:
+`.github/workflows/release.yml` builds with PyInstaller on GitHub:
+`pdf2excel-gui-windows.zip` (the window: unzip the folder and run `pdf2excel-gui.exe` inside it)
+and `pdf2excel.exe` (command line, same arguments as the script). The window is a folder, not a
+single exe, on purpose: a one-file exe unpacks about 100 MB on every start, which is slow
+(more so with antivirus). Push a version tag to build them and attach them to a release:
 
     git tag v1.0.0
     git push origin v1.0.0
 
-Running the workflow manually (Actions tab, "Run workflow") builds the exe files
-and keeps them as a downloadable artifact without making a release.
+Running the workflow manually (Actions tab, "Run workflow") builds them and keeps them as a
+downloadable artifact without making a release.
+

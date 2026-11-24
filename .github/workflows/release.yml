@@ -21,11 +21,12 @@ jobs:
       - name: Install dependencies
         run: pip install pdfplumber xlsxwriter pymupdf fonttools pyinstaller
 
-      - name: Build GUI exe
-        run: >
-          pyinstaller --onefile --windowed --name pdf2excel-gui
-          --collect-data pdfminer --collect-all pypdfium2 --collect-all pymupdf
-          pdf2excel_gui.py
+      # --onedir for the window: a --onefile exe unpacks ~100 MB to a temp folder on every start
+      # (slow, and antivirus scans it each time); a folder starts straight away.
+      - name: Build GUI (folder) and zip it
+        run: |
+          pyinstaller --onedir --windowed --name pdf2excel-gui --collect-data pdfminer --collect-all pypdfium2 --collect-all pymupdf pdf2excel_gui.py
+          Compress-Archive -Path dist/pdf2excel-gui -DestinationPath dist/pdf2excel-gui-windows.zip
 
       - name: Build command-line exe
         run: >
@@ -42,12 +43,16 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-exe
-          path: dist/*.exe
+          name: windows-build
+          path: |
+            dist/pdf2excel-gui-windows.zip
+            dist/pdf2excel.exe
 
       - name: Upload to GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.exe
+          files: |
+            dist/pdf2excel-gui-windows.zip
+            dist/pdf2excel.exe
           generate_release_notes: true
