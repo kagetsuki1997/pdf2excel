@@ -79,6 +79,13 @@ same thing (blank = auto-detect).
 - Merged cells in the PDF table are merged in Excel too (spanning headers, vertically merged cells).
 - A smaller character is a subscript/superscript only if its baseline is also lowered/raised, so
   small-caps headings (a big first letter followed by smaller capitals) stay normal text.
+- Text in a cell is ordered by its position on the page (lines top to bottom, letters left to right),
+  not by the order the PDF writes it, so PDFs that write text out of order still read correctly.
+  A space is added where the gap between two letters is word-sized and the PDF has no space character.
+- Watermarks are ignored: large (24 pt or more) text that is diagonal or very light, big faded
+  shapes, and page-sized pictures. A figure that had a watermark behind it is drawn from its cleaned
+  data (so the Excel picture is clean too) and gets no `_outlined.svg`. Small or tiled watermarks,
+  and watermarks made of many small outline shapes, are not detected. Limits are in `watermark.py`.
 - A line inside a cell is a new line only when its baseline moves by more than 0.7 x font size,
   so wrapped text works and spaces sized differently from the letters cannot turn a cell into subscripts.
 - Characters from the Windows Symbol font (stored as private-use code points, which Excel shows as

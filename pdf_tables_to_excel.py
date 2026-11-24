@@ -25,10 +25,12 @@ import os
 import re
 import sys
 
+import watermark
 from symbolmap import fix_char          # Symbol-font private-use characters -> real symbols (<, <=, >=, ...)
 SIZE_DROP = 0.9     # a char is "script" if its size < 90% of the largest size on its line
 SHIFT = 0.15        # pt a smaller char's baseline must be raised/lowered to count as super/subscript
-LINE_SHIFT = 0.7    # a char whose baseline moves more than 0.7 x font size starts a new line
+WORD_GAP = 0.3      # gap (x font size) between two letters that means a word break
+LINE_SHIFT = 0.7    # baselines further apart than ~0.6 x font size are different lines
 
 
 def parse_pages(text):
@@ -49,37 +51,55 @@ def count_pages(pdf):
         return len(d)
 
 
-def split_lines(chars):
-    """Group a cell's characters into text lines by baseline.
+def _frame(c):
+    """(along, across): the char's origin measured along its writing direction and across it."""
+    a, b, e, f = c["matrix"][0], c["matrix"][1], c["matrix"][4], c["matrix"][5]
+    if c["upright"] and abs(b) < 1e-6 and a > 0:       # normal text: use the glyph's centre, so a
+        return (c["x0"] + c["x1"]) / 2, f              # space that overlaps its neighbour stays in order
+    n = math.hypot(a, b) or 1.0
+    a, b = a / n, b / n
+    return e * a + f * b, f * a - e * b
 
-    Spaces never decide anything (some PDFs size them differently from the letters). A line is
-    broken only when a letter's baseline moves by more than LINE_SHIFT x font size, which is far
-    more than any subscript/superscript offset but less than any line pitch."""
-    lines = []
+
+def split_lines(chars):
+    """Order a cell's characters as a reader would see them: lines top to bottom, characters
+    left to right. The order in which a PDF writes its characters is not trusted (some generators
+    write lines bottom-up or words out of order), so this works from positions only.
+
+    Lines are found by clustering baselines; the gap needed to start a new line is larger than any
+    subscript/superscript offset but smaller than a line pitch. Rotated text is handled in its own
+    frame (a vertical label reads along its own direction)."""
+    groups = {}
     for c in chars:
-        if not c["text"].strip():
-            if lines:
-                lines[-1].append(c)
-            else:
-                lines.append([c])
-            continue
-        if lines:
-            letters = [x for x in lines[-1] if x["text"].strip()]
-            if letters:
-                big = max(x["size"] for x in letters)
-                ref = next(x["matrix"][5] for x in letters if x["size"] >= big - 0.05)
-                if abs(c["matrix"][5] - ref) > LINE_SHIFT * max(big, c["size"]):
-                    lines.append([c])
-                    continue
-            lines[-1].append(c)
-        else:
-            lines.append([c])
+        angle = round(math.degrees(math.atan2(c["matrix"][1], c["matrix"][0])) / 5) * 5
+        groups.setdefault(angle, []).append(c)
+    lines = []
+    for angle in sorted(groups, key=lambda x: (x != 0, x)):         # upright text first
+        cs = groups[angle]
+        letters = sorted(c["size"] for c in cs if c["text"].strip()) or [c["size"] for c in cs]
+        gap = max(2.0, LINE_SHIFT * letters[len(letters) // 2] * 0.85)
+        pos = sorted(((*_frame(c)[::-1], c) for c in cs), key=lambda t: -t[0])    # across, descending
+        cluster, last = [], None
+        for across, along, c in pos:
+            if last is not None and last - across > gap:
+                lines.append([x[1] for x in sorted(cluster, key=lambda t: t[0])])
+                cluster = []
+            cluster.append((along, c))
+            last = across
+        if cluster:
+            lines.append([x[1] for x in sorted(cluster, key=lambda t: t[0])])
     return lines
+
+
+def _is_watermark(c):
+    """Large faded or diagonal text (a watermark behind the table) is not table content."""
+    return watermark.is_watermark_text(c["size"], watermark.lightness(c.get("non_stroking_color")),
+                                       c["matrix"][0], c["matrix"][1])
 
 
 def cell_runs(page, bbox):
     """Return [(text, kind)] runs; kind is '', 'sub' or 'sup'."""
-    chars = [c for c in page.crop(bbox).chars if c["text"] != "\n"]
+    chars = [c for c in page.crop(bbox).chars if c["text"] != "\n" and not _is_watermark(c)]
     runs = []
     for line in split_lines(chars):
         letters = [c for c in line if c["text"].strip()]
@@ -89,7 +109,14 @@ def cell_runs(page, bbox):
             runs.append((" ", ""))
         big = max(c["size"] for c in letters)
         ref_base = next(c["matrix"][5] for c in letters if c["size"] >= big - 0.05)
+        prev = None
         for c in line:
+            # PDFs without real space characters separate words only by a gap: restore the space
+            if (prev is not None and c["text"].strip() and prev["text"].strip() and c["upright"] and prev["upright"]
+                    and abs(c["size"] - prev["size"]) < 0.1 * prev["size"]
+                    and c["x0"] - prev["x1"] > WORD_GAP * prev["size"]):
+                runs.append((" ", ""))
+            prev = c if c["text"].strip() else None
             kind = ""
             if c["text"].strip() and c["size"] < big * SIZE_DROP:
                 # PDF y grows upward. Smaller AND raised = superscript, smaller AND lowered = subscript;
@@ -204,10 +231,14 @@ def write_figures(wb, pdf, pages, manual, svg_dir, dpi=200):
             ws = wb.add_worksheet(f"Fig p{n}")
             row = 0
             for k, r in enumerate(rects, 1):
-                png, w_pt, h_pt = pdf_figures.render_png(page, r, dpi)
-                os.makedirs(svg_dir, exist_ok=True)
-                save_svg(page, r, os.path.join(svg_dir, f"p{n}_fig{k}_outlined.svg"))
                 clean = pdf_vector.extract_figure(page, r)
+                os.makedirs(svg_dir, exist_ok=True)
+                if clean["watermark"]:
+                    # the page picture would show the watermark: draw the figure from its clean data
+                    png, w_pt, h_pt = pdf_vector.render_png(clean, dpi), clean["width"], clean["height"]
+                else:
+                    png, w_pt, h_pt = pdf_figures.render_png(page, r, dpi)
+                    save_svg(page, r, os.path.join(svg_dir, f"p{n}_fig{k}_outlined.svg"))
                 with open(os.path.join(svg_dir, f"p{n}_fig{k}.svg"), "w", encoding="utf-8") as fh:
                     fh.write(pdf_vector.to_svg(clean))
                 ws.write_string(row, 0, f"Page {n} - figure {k}", bold)

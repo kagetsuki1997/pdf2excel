@@ -13,6 +13,7 @@ import re
 from xml.sax.saxutils import escape, quoteattr
 
 import pymupdf
+import watermark
 from symbolmap import fix_char
 from fontTools.pens.basePen import BasePen
 from fontTools.ttLib import TTFont
@@ -185,6 +186,7 @@ def extract_figure(page, rect, pad=4):
     page_area = page.rect.width * page.rect.height
 
     shapes = []
+    wm = False          # True if watermark items were left out of this figure
     for d in page.get_drawings():
         r = pymupdf.Rect(d["rect"])
         probe = pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5)
@@ -193,6 +195,9 @@ def extract_figure(page, rect, pad=4):
         fill = d.get("fill") if d["type"] in ("f", "fs") else None
         stroke = d.get("color") if d["type"] in ("s", "fs") else None
         if fill is None and stroke is None:
+            continue
+        if watermark.is_faded_fill(fill, stroke, r.width * r.height, page_area):
+            wm = True
             continue
         subs = [_shift(s, -ox, -oy) for s in _subpaths(d["items"], d.get("closePath"))]
         subs = [s for s in subs if len(s) > 1]
@@ -237,6 +242,9 @@ def extract_figure(page, rect, pad=4):
             dx, dy = dx / n, dy / n
             big = max(s["size"] for s in spans)
             first = next(s for s in spans if s["size"] >= big - 0.05)
+            if watermark.is_watermark_text(big, watermark.int_lightness(first["color"]), dx, dy):
+                wm = True
+                continue
             nx, ny = -dy, dx                      # unit normal, "downwards" in the text's own frame
             p0 = first["origin"]
             runs = []
@@ -260,12 +268,23 @@ def extract_figure(page, rect, pad=4):
     images = []
     for info in page.get_image_info():
         b = pymupdf.Rect(info["bbox"])
+        if b.intersects(clip) and b.width * b.height >= watermark.BIG_IMAGE * page_area:
+            wm = True                     # page-sized picture: a watermark or background
+            continue
         if b.width >= 20 and b.height >= 20 and b.intersects(clip) and b.width * b.height < PAGE_FRACTION * page_area:
             png = page.get_pixmap(clip=b & clip, dpi=150).tobytes("png")
             c = b & clip
             images.append({"bbox": (c.x0 - ox, c.y0 - oy, c.x1 - ox, c.y1 - oy), "png": png})
 
-    return {"width": clip.width, "height": clip.height, "shapes": shapes, "texts": texts, "images": images}
+    return {"width": clip.width, "height": clip.height, "shapes": shapes, "texts": texts, "images": images,
+            "watermark": wm}
+
+
+def render_png(fig, dpi=200):
+    """Render an extracted figure (so without its watermark) to PNG bytes via its clean SVG."""
+    svg = to_svg(fig).encode("utf-8")
+    doc = pymupdf.open(stream=svg, filetype="svg")
+    return doc[0].get_pixmap(dpi=dpi).tobytes("png")
 
 
 # ----------------------------------------------------------------------------- SVG

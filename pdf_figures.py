@@ -5,6 +5,7 @@ image that is not part of a table and not in the page header/footer. Short text
 labels around the drawing and a "Figure ..." caption below it are included.
 """
 import pymupdf
+import watermark
 
 HEADER = 0.10        # top 10% of the page is header
 FOOTER = 0.11        # bottom 11% of the page is footer
@@ -75,13 +76,20 @@ def detect_figures(page):
         return not (r.y1 < top or r.y0 > bottom) and not any(r.intersects(t) for t in tables)
 
     items, organic = [], []
+    page_area = W * H
     for d in page.get_drawings():
         r = _inflate(pymupdf.Rect(d["rect"]), 0.5)
+        stroke = d.get("color") if d["type"] in ("s", "fs") else None
+        fill = d.get("fill") if d["type"] in ("f", "fs") else None
+        if watermark.is_faded_fill(fill, stroke, r.width * r.height, page_area):
+            continue                                  # faded logo / background shape
         if usable(r):
             items.append(r)
             organic.append(_is_organic(d))
     for info in page.get_image_info():
         r = pymupdf.Rect(info["bbox"])
+        if r.width * r.height >= watermark.BIG_IMAGE * page_area:
+            continue                                  # page-sized picture: watermark / background
         if r.width >= 30 and r.height >= 30 and usable(r):
             items.extend([r] * MIN_ITEMS)         # one picture counts as a figure on its own
             organic.extend([True] * MIN_ITEMS)
