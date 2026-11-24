@@ -13,13 +13,13 @@ import re
 from xml.sax.saxutils import escape, quoteattr
 
 import pymupdf
+from symbolmap import fix_char
 from fontTools.pens.basePen import BasePen
 from fontTools.ttLib import TTFont
 
 SIZE_DROP = 0.9    # a span is subscript/superscript if smaller than 90% of the biggest span in its line
-RAISE = 0.15       # pt a span's baseline must be above the line's to count as superscript
+SHIFT = 0.15       # pt a smaller span's baseline must be raised/lowered to count as super/subscript
 PAGE_FRACTION = 0.9
-PUA = {"": "θ", "": "Ψ", "": "°", "": "µ", "": "Ω", "": "ω"}
 
 
 # ----------------------------------------------------------------------------- extraction
@@ -244,9 +244,9 @@ def extract_figure(page, rect, pad=4):
                 v = (s["origin"][0] - p0[0]) * nx + (s["origin"][1] - p0[1]) * ny   # baseline offset
                 kind = ""
                 if s["size"] < big * SIZE_DROP and s["text"].strip():
-                    kind = "sup" if v < -RAISE else "sub"
+                    kind = "sup" if v < -SHIFT else "sub" if v > SHIFT else ""
                 runs.append({
-                    "text": "".join(PUA.get(c, c) for c in s["text"]),
+                    "text": "".join(fix_char(c) for c in s["text"]),
                     "size": s["size"], "color": _hex(((s["color"] >> 16 & 255) / 255,
                                                       (s["color"] >> 8 & 255) / 255, (s["color"] & 255) / 255)),
                     "family": _family(s["font"]), "bold": bool(s["flags"] & 16), "italic": bool(s["flags"] & 2),

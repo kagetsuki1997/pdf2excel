@@ -77,10 +77,14 @@ same thing (blank = auto-detect).
   at the top of the script if a PDF uses different sizes.
 - Superscripts are implemented but not yet tested on a real PDF.
 - Merged cells in the PDF table are merged in Excel too (spanning headers, vertically merged cells).
+- A smaller character is a subscript/superscript only if its baseline is also lowered/raised, so
+  small-caps headings (a big first letter followed by smaller capitals) stay normal text.
 - A line inside a cell is a new line only when its baseline moves by more than 0.7 x font size,
   so wrapped text works and spaces sized differently from the letters cannot turn a cell into subscripts.
-- Symbol-font characters are mapped to θ Ψ ° µ Ω ω. Add more to `M` if a PDF
-  shows odd characters.
+- Characters from the Windows Symbol font (stored as private-use code points, which Excel shows as
+  blanks) are mapped to real symbols such as < ≤ ≥ ± → θ µ Ω with the full table in `symbolmap.py`.
+  A symbol the PDF stores as a blank character cannot be recovered in table text (figures redraw it
+  as a shape).
 - Formatting shows in Excel; some viewers (Preview, Numbers) may not show it.
 
 ## Windows build (no Python or uv needed)

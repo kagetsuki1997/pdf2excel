@@ -25,9 +25,9 @@ import os
 import re
 import sys
 
-M = {"": "θ", "": "Ψ", "": "°", "": "µ", "": "Ω", "": "ω"}
+from symbolmap import fix_char          # Symbol-font private-use characters -> real symbols (<, <=, >=, ...)
 SIZE_DROP = 0.9     # a char is "script" if its size < 90% of the largest size on its line
-RAISE = 0.15        # pt above the line's baseline that counts as superscript
+SHIFT = 0.15        # pt a smaller char's baseline must be raised/lowered to count as super/subscript
 LINE_SHIFT = 0.7    # a char whose baseline moves more than 0.7 x font size starts a new line
 
 
@@ -92,9 +92,11 @@ def cell_runs(page, bbox):
         for c in line:
             kind = ""
             if c["text"].strip() and c["size"] < big * SIZE_DROP:
-                # PDF y grows upward: raised baseline = superscript, otherwise subscript
-                kind = "sup" if c["matrix"][5] - ref_base > RAISE else "sub"
-            runs.append((M.get(c["text"], c["text"]), kind))
+                # PDF y grows upward. Smaller AND raised = superscript, smaller AND lowered = subscript;
+                # smaller on the same baseline is small caps / small print: leave it normal.
+                shift = c["matrix"][5] - ref_base
+                kind = "sup" if shift > SHIFT else "sub" if shift < -SHIFT else ""
+            runs.append((fix_char(c["text"]), kind))
     merged = []
     for t, k in runs:
         if merged and merged[-1][1] == k:
