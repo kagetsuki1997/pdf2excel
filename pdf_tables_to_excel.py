@@ -29,8 +29,12 @@ import watermark
 from symbolmap import fix_char          # Symbol-font private-use characters -> real symbols (<, <=, >=, ...)
 SIZE_DROP = 0.9     # a char is "script" if its size < 90% of the largest size on its line
 SHIFT = 0.15        # pt a smaller char's baseline must be raised/lowered to count as super/subscript
-WORD_GAP = 0.3      # gap (x font size) between two letters that means a word break
+WORD_GAP = 0.15     # gap (x font size) between two letters that means a word break (letters inside a
+                    # word sit within ~0.03 x size of each other, word gaps are ~0.25 x size or more)
 LINE_SHIFT = 0.7    # baselines further apart than ~0.6 x font size are different lines
+MIN_CURVE = 20      # pt: curves smaller than this are never table borders
+MIN_FILL = 0.6      # a table must have text in at least this share of its cells (else: diagram boxes)
+MAX_COL = 100      # widest Excel column (characters); wide enough that a PDF line is not re-wrapped
 
 
 def parse_pages(text):
@@ -97,24 +101,31 @@ def _is_watermark(c):
                                        c["matrix"][0], c["matrix"][1])
 
 
+def cell_chars(page, bbox):
+    """The cell's characters: those whose centre lies inside it. (page.crop would also take the
+    edge of a character in the next cell that pokes slightly over the border.)"""
+    x0, top, x1, bottom = bbox
+    return [c for c in page.chars
+            if x0 <= (c["x0"] + c["x1"]) / 2 <= x1 and top <= (c["top"] + c["bottom"]) / 2 <= bottom
+            and c["text"] != "\n" and not _is_watermark(c)]
+
+
 def cell_runs(page, bbox):
-    """Return [(text, kind)] runs; kind is '', 'sub' or 'sup'."""
-    chars = [c for c in page.crop(bbox).chars if c["text"] != "\n" and not _is_watermark(c)]
+    """Return [(text, kind)] runs; kind is '', 'sub' or 'sup'. Every line of the cell in the PDF
+    stays its own line ('\\n' between them), so the Excel cell reads like the PDF."""
+    lines = [ln for ln in split_lines(cell_chars(page, bbox)) if any(c["text"].strip() for c in ln)]
     runs = []
-    for line in split_lines(chars):
+    for i, line in enumerate(lines):
         letters = [c for c in line if c["text"].strip()]
-        if not letters:
-            continue
-        if runs:
-            runs.append((" ", ""))
+        if i:
+            runs.append(("\n", ""))
         big = max(c["size"] for c in letters)
         ref_base = next(c["matrix"][5] for c in letters if c["size"] >= big - 0.05)
         prev = None
         for c in line:
             # PDFs without real space characters separate words only by a gap: restore the space
             if (prev is not None and c["text"].strip() and prev["text"].strip() and c["upright"] and prev["upright"]
-                    and abs(c["size"] - prev["size"]) < 0.1 * prev["size"]
-                    and c["x0"] - prev["x1"] > WORD_GAP * prev["size"]):
+                    and c["x0"] - prev["x1"] > WORD_GAP * max(c["size"], prev["size"])):
                 runs.append((" ", ""))
             prev = c if c["text"].strip() else None
             kind = ""
@@ -134,11 +145,14 @@ def cell_runs(page, bbox):
 
 
 def clean_runs(runs):
-    runs = [[t, k] for t, k in runs if t]
+    """Collapse repeated spaces, drop spaces next to a line break and at the ends; keep '\\n'."""
+    runs = [[re.sub(r"[ \t]+", " ", t), k] for t, k in runs if t]
     for i in range(len(runs)):
-        runs[i][0] = re.sub(r" {2,}", " ", runs[i][0])
-        if i and runs[i - 1][0].endswith(" "):
+        runs[i][0] = re.sub(r" ?\n ?", "\n", runs[i][0])
+        if i and runs[i - 1][0].endswith((" ", "\n")):
             runs[i][0] = runs[i][0].lstrip(" ")
+        if i + 1 < len(runs) and runs[i + 1][0].startswith("\n"):
+            runs[i][0] = runs[i][0].rstrip(" ")
     runs = [r for r in runs if r[0]]
     if runs:
         runs[0][0] = runs[0][0].lstrip()
@@ -146,12 +160,16 @@ def clean_runs(runs):
     return [r for r in runs if r[0]]
 
 
+def cell_text(runs):
+    return "".join(t for t, _ in clean_runs(runs))
+
+
 def write_cell(ws, wb, row, col, runs, fmt):
     runs = clean_runs(runs)
     if not runs:
         return
     if all(k == "" for _, k in runs):
-        ws.write_string(row, col, " ".join("".join(t for t, _ in runs).split()), fmt)
+        ws.write_string(row, col, "".join(t for t, _ in runs), fmt)
         return
     parts = []
     for t, k in runs:
@@ -177,6 +195,29 @@ def _boundaries(values, tol=1.5):
 
 def _index(v, bounds):
     return min(range(len(bounds)), key=lambda i: abs(bounds[i] - v))
+
+
+def _grid_line(obj):
+    """False for drawings that cannot be table borders: curves with slanted segments or smaller
+    than MIN_CURVE (logos, icons, glyph outlines). pdfplumber snaps nearby vertical edges of the
+    whole page together, so such shapes could drag a real column border sideways and lose cells."""
+    if obj.get("object_type") != "curve":
+        return True
+    if max(obj["width"], obj["height"]) < MIN_CURVE:
+        return False
+    pts = obj.get("pts") or []
+    return all(abs(a[0] - b[0]) < 0.5 or abs(a[1] - b[1]) < 0.5 for a, b in zip(pts, pts[1:]))
+
+
+def find_tables(page):
+    return page.filter(_grid_line).find_tables()
+
+
+def is_table(grid, table):
+    """A real table has text in most of its cells. Boxes in a circuit or block diagram (a labelled
+    box, a dashed frame, a package outline) are found as 'tables' too, but are mostly empty."""
+    filled = sum(1 for cells in grid for runs in cells if cell_text(runs))
+    return filled >= 2 and filled >= MIN_FILL * len(table.cells)
 
 
 def table_grid(page, table):
@@ -268,10 +309,14 @@ def main(pdf, out, first=None, last=None, figures=None):
             sys.exit(f"Invalid page range {first}-{last} (PDF has {total} pages)")
         for n in range(first, last + 1):
             page = p.pages[n - 1]
-            for ti, t in enumerate(page.find_tables(), 1):
+            ti = 0
+            for t in find_tables(page):
+                grid, merges = table_grid(page, t)
+                if not is_table(grid, t):
+                    continue
+                ti += 1
                 ws.write_string(row, 0, f"Page {n} - table {ti}", bold)
                 row += 1
-                grid, merges = table_grid(page, t)
                 for r0, c0, r1, c1 in merges:       # merge first, then write the top-left cell
                     try:
                         ws.merge_range(row + r0, c0, row + r1, c1, "", cell)
@@ -282,18 +327,18 @@ def main(pdf, out, first=None, last=None, figures=None):
                         write_cell(ws, wb, row + ri, ci, runs, cell)
                 for ri, cells_in_row in enumerate(grid):
                     for ci, runs in enumerate(cells_in_row):
-                        length = len("".join(x for x, _ in clean_runs(runs)))
+                        lines = [len(x) for x in cell_text(runs).split("\n")]
                         span = next((m for m in merges if (m[0], m[1]) == (ri, ci)), None)
                         if span is None:
-                            width[ci] = max(width.get(ci, 0), length)
-                        elif span[2] == span[0] and length:
-                            spans.append((row + ri, span[1], span[3], length))
+                            width[ci] = max(width.get(ci, 0), max(lines))
+                        elif span[2] == span[0] and max(lines):
+                            spans.append((row + ri, span[1], span[3], lines))
                 row += len(grid) + 1
     for ci, w in width.items():
-        ws.set_column(ci, ci, min(45, w + 2))
-    for r, c0, c1, length in spans:       # Excel does not auto-fit merged cells: size their rows
-        chars = sum(min(45, width.get(c, 8) + 2) for c in range(c0, c1 + 1))
-        ws.set_row(r, 15 * max(1, math.ceil(length * 1.1 / max(chars, 1))))
+        ws.set_column(ci, ci, min(MAX_COL, w + 2))
+    for r, c0, c1, lines in spans:        # Excel does not auto-fit merged cells: size their rows
+        chars = sum(min(MAX_COL, width.get(c, 8) + 2) for c in range(c0, c1 + 1))
+        ws.set_row(r, 15 * sum(max(1, math.ceil(n * 1.1 / max(chars, 1))) for n in lines))
     found = {}
     svg_dir = None
     if figures:

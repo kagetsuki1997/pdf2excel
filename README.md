@@ -81,7 +81,19 @@ same thing (blank = auto-detect).
   small-caps headings (a big first letter followed by smaller capitals) stay normal text.
 - Text in a cell is ordered by its position on the page (lines top to bottom, letters left to right),
   not by the order the PDF writes it, so PDFs that write text out of order still read correctly.
-  A space is added where the gap between two letters is word-sized and the PDF has no space character.
+  A space is added where the gap between two letters is word-sized (more than 0.15 x font size,
+  `WORD_GAP`) and the PDF has no space character, also right after a subscript.
+- Every line of a cell stays its own line in Excel (Alt+Enter line break), exactly as in the PDF,
+  and columns are made wide enough (up to `MAX_COL` characters) that a line is not re-wrapped.
+- A character belongs to the cell that contains its centre, so a letter that pokes a little over
+  a cell border stays in its own cell.
+- Logos and other small or slanted drawings are ignored when finding table borders: they could
+  pull a nearby column border sideways and make cells disappear (`MIN_CURVE`).
+- Boxes in circuit and block diagrams look like tables to the detector. A "table" is only kept when
+  at least 2 cells and at least 60% of its cells contain text (`MIN_FILL`), so labelled boxes, dashed
+  frames and package outlines do not end up in the sheet.
+- Only tables drawn with ruled borders are found. Borderless lists (for example "Absolute Maximum
+  Ratings" written with dot leaders) are not extracted.
 - Watermarks are ignored: large (24 pt or more) text that is diagonal or very light, big faded
   shapes, and page-sized pictures. A figure that had a watermark behind it is drawn from its cleaned
   data (so the Excel picture is clean too) and gets no `_outlined.svg`. Small or tiled watermarks,
